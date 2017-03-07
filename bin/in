@@ -1,0 +1,39 @@
+#!/bin/bash
+set -eo pipefail
+exec 3>&1 # use fd 3 for script output
+exec 1>&2 # send normal stdout to stderr for logging
+payload=$(mktemp /tmp/resource-in.XXXXXX)
+cat > "$payload" <&0
+
+cd $1
+
+HELM_REPO=$(jq -r .source.helm_repo < "$payload")
+HELM_BUCKET=$(jq -r .source.helm_bucket < "$payload")
+
+echo "Helm Repository: $HELM_REPO"
+echo "Helm Bucket: $HELM_BUCKET"
+echo "Fetching Helm Bucket"
+rm -Rf /tmp/ci
+mkdir /tmp/ci
+gsutil rsync gs://$HELM_BUCKET /tmp/ci/
+cd /tmp/ci
+helm serve --repo-path /tmp/ci/ &
+PID=$!
+sleep 5
+function killServe {
+  until kill -9 $PID
+  do
+    echo "Trying to Kill HELM Server"
+    sleep 5
+  done
+}
+trap killServe EXIT
+helm repo add ci http://127.0.0.1:8879
+helm repo update
+echo "Local Repository added"
+
+HELM_PACKAGE=$(jq -r .source.helm_package < "$payload")
+HELM_VERSION=$(jq -r .version.ref < "$payload")
+echo "Fetching package $HELM_PACKAGE version $HELM_VERSION from repo $HELM_REPO"
+helm fetch --untar --version $HELM_VERSION --destination $1 ci/$HELM_PACKAGE
+echo "{\"version\": {\"ref\": \"$HELM_VERSION\"}, \"metadata\": []}" | jq -s add  >&3

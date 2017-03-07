@@ -1,0 +1,86 @@
+#!/bin/bash
+set -eo pipefail
+exec 3>&1 # use fd 3 for script output
+exec 1>&2 # send normal stdout to stderr for logging
+payload=$(mktemp /tmp/resource-in.XXXXXX)
+cat > "$payload" <&0
+
+cd $1
+
+HELM_REPO=$(jq -r .source.helm_repo < "$payload")
+HELM_BUCKET=$(jq -r .source.helm_bucket < "$payload")
+
+echo "Helm Repository: $HELM_REPO"
+echo "Helm Bucket: $HELM_BUCKET"
+echo "Fetching Helm Bucket"
+rm -Rf /tmp/ci
+mkdir /tmp/ci
+gsutil rsync gs://$HELM_BUCKET /tmp/ci/
+cd /tmp/ci
+helm serve --repo-path /tmp/ci/ &
+PID=$!
+sleep 5
+function killServe {
+  until kill -9 $PID
+  do
+    echo "Trying to Kill HELM Server"
+    sleep 5
+  done
+}
+trap killServe EXIT
+helm repo add ci http://127.0.0.1:8879
+helm repo update
+echo "Local Repository added"
+
+HELM_PACKAGE=$(jq -r .source.helm_package < "$payload")
+HELM_VERSION=$(jq -r .params.version < "$payload")
+HELM_DEPLOY=$(jq -r .params.deploy < "$payload")
+if [[ -f "$1/$HELM_VERSION" ]]
+then
+  HELM_VERSION=$(cat $1/$HELM_VERSION)
+fi
+if [ "$HELM_DEPLOY" = "true" ]
+then
+  echo "Deploying package $HELM_PACKAGE in namespace $HELM_NAMESPACE"
+  HELM_NAMESPACE=$(jq -r .params.namespace < "$payload")
+  KUBE_LOGIN=$(jq -r .params.kube_login < "$payload")
+  KUBE_PASSWORD=$(jq -r .params.kube_password < "$payload")
+  KUBE_URL=$(jq -r .params.kube_url < "$payload")
+  kubectl config set-cluster cluster --insecure-skip-tls-verify=true --server=$KUBE_URL
+  kubectl config set-credentials cluster-admin --username=$KUBE_LOGIN --password=$KUBE_PASSWORD
+  kubectl config set-context helm --user=cluster-admin --cluster=cluster
+  kubectl config use-context helm
+  kubectl version
+  jq .params.variables < "$payload" > vars.json
+
+  if [ "$(cat vars.json)" = "null" ]
+  then
+    helm upgrade -i $HELM_PACKAGE-$HELM_NAMESPACE ci/$HELM_PACKAGE --version $HELM_VERSION --namespace $HELM_NAMESPACE
+  else
+    helm upgrade -i $HELM_PACKAGE-$HELM_NAMESPACE ci/$HELM_PACKAGE --version $HELM_VERSION --namespace $HELM_NAMESPACE -f vars.json
+  fi
+else
+  echo "Pushing package $HELM_PACKAGE in bucket $HELM_BUCKET"
+  HELM_DIR=$(jq -r .params.dir < "$payload")
+  if [ "$HELM_VERSION" = "null" ]
+  then
+    cd $1/$HELM_DIR
+    helm dependency update
+    echo "Packaging $HELM_PACKAGE"
+    helm package .
+    HELM_VERSION=$(cat $1/$HELM_DIR/Chart.yaml | grep version | cut -d ':' -f2 | tr -d '[:space:]')
+    echo "No version defined, detected version $HELM_VERSION from resulting package"
+    rm -f /tmp/ci/$HELM_PACKAGE-$HELM_VERSION.tgz
+    mv $1/$HELM_DIR/$HELM_PACKAGE-$HELM_VERSION.tgz /tmp/ci/
+  else
+    cd $1/$HELM_DIR
+    helm dependency update
+    echo "Packaging $HELM_PACKAGE version $HELM_VERSION"
+    helm package --version $HELM_VERSION .
+    rm -f /tmp/ci/$HELM_PACKAGE-$HELM_VERSION.tgz
+    mv $1/$HELM_DIR/$HELM_PACKAGE-$HELM_VERSION.tgz /tmp/ci/
+  fi
+  helm repo index . --url $HELM_REPO
+  gsutil rsync /tmp/ci/ gs://$HELM_BUCKET
+fi
+echo "{\"version\": {\"ref\": \"$HELM_VERSION\"}, \"metadata\": []}" | jq -s add  >&3
